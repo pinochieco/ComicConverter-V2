@@ -1,0 +1,21 @@
+# Build
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+CBR2CBZ.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+*.icloud
+
+# Config locali
+config.json
