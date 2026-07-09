@@ -47,7 +47,17 @@ class Convertitore:
                     else:  # PDF
                         risultato = self._cbr_in_pdf(f, cartella_output)
                 elif f.suffix.lower() == ".cbz":
-                    risultato = self._cbz_in_pdf(f, cartella_output)
+                    if formato_output == "PDF":
+                        risultato = self._cbz_in_pdf(f, cartella_output)
+                    else:
+                        risultato = self._cbz_in_pdf(f, cartella_output)
+                elif f.suffix.lower() == ".pdf":
+                    if formato_output == "CBZ":
+                        risultato = self._pdf_in_cbz(f, cartella_output)
+                    elif formato_output == "CBR":
+                        risultato = (False, "CBR non supportato, usa CBZ")
+                    else:
+                        risultato = (False, "Formato non supportato")
                 else:
                     risultato = (False, "Formato non supportato")
                 
@@ -188,6 +198,46 @@ class Convertitore:
             return False, str(e)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+    
+    def _pdf_in_cbz(self, file_in, cartella_out=""):
+        """Converte un PDF in CBZ estraendo le pagine come immagini"""
+        tmp = tempfile.mkdtemp(prefix="pdf2cbz_")
+        try:
+            from PIL import Image
+            import fitz  # PyMuPDF per estrarre pagine PDF
+            pdf_doc = fitz.open(str(file_in))
+            
+            immagini_out = []
+            for num_pagina in range(pdf_doc.page_count):
+                pagina = pdf_doc[num_pagina]
+                # Render pagina a 200 DPI
+                mat = fitz.Matrix(2.0, 2.0)  # 200 DPI circa
+                pix = pagina.get_pixmap(matrix=mat)
+                img_path = os.path.join(tmp, f"page_{num_pagina+1:04d}.png")
+                pix.save(img_path)
+                immagini_out.append(img_path)
+            
+            pdf_doc.close()
+            
+            if not immagini_out:
+                return False, "Nessuna pagina estratta dal PDF"
+            
+            if cartella_out:
+                dest = Path(cartella_out) / (file_in.stem + ".cbz")
+            else:
+                dest = file_in.with_suffix(".cbz")
+            
+            with zipfile.ZipFile(str(dest), "w", zipfile.ZIP_DEFLATED) as zf:
+                for img in immagini_out:
+                    zf.write(img, os.path.basename(img))
+            
+            return True, "OK"
+        except ImportError:
+            return False, "PyMuPDF non installato (pip3 install PyMuPDF)"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class MainWindow(QMainWindow):
@@ -281,7 +331,7 @@ class MainWindow(QMainWindow):
         riga_opts.addWidget(lbl_in)
         
         self.cmb_input = QComboBox()
-        self.cmb_input.addItems(["CBR", "CBZ", "CBR e CBZ"])
+        self.cmb_input.addItems(["CBR", "CBZ", "PDF", "CBR e CBZ", "Tutti i formati"])
         self.cmb_input.setFont(QFont("SF Pro Text", 10))
         self.cmb_input.setObjectName("combo")
         riga_opts.addWidget(self.cmb_input)
@@ -647,11 +697,14 @@ class MainWindow(QMainWindow):
         self.label_stato.setText("Scansione in corso...")
         
         # Determina pattern in base al formato input
-        formati = []
-        if self.cmb_input.currentText() in ("CBR", "CBR e CBZ"):
-            formati.append("*.cbr")
-        if self.cmb_input.currentText() in ("CBZ", "CBR e CBZ"):
-            formati.append("*.cbz")
+        formato_input = self.cmb_input.currentText()
+        estensioni_valide = []
+        if formato_input in ("CBR", "CBR e CBZ", "Tutti i formati"):
+            estensioni_valide.append(".cbr")
+        if formato_input in ("CBZ", "CBR e CBZ", "Tutti i formati"):
+            estensioni_valide.append(".cbz")
+        if formato_input in ("PDF", "Tutti i formati"):
+            estensioni_valide.append(".pdf")
         
         files_trovati = []
         p = Path(path)
@@ -664,8 +717,9 @@ class MainWindow(QMainWindow):
                     elif f.suffix.lower() == ".cbz" and "CBZ" in self.cmb_input.currentText():
                         files_trovati.append(f)
         else:
-            for ext in formati:
-                files_trovati.extend(sorted(p.glob(ext)))
+            for ext in estensioni_valide:
+                # glob vuole il punto, trasformiamo .cbr in *.cbr
+                files_trovati.extend(sorted(p.glob(f"*{ext}")))
         
         files_trovati = sorted(set(files_trovati))
         
