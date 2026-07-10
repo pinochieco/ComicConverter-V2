@@ -243,7 +243,7 @@ class Convertitore:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Convertitore CBR/CBZ")
+        self.setWindowTitle("Comic Convert")
         self.setMinimumSize(900, 650)
         self.resize(950, 700)
         
@@ -277,12 +277,12 @@ class MainWindow(QMainWindow):
         h_layout = QVBoxLayout(header)
         h_layout.setContentsMargins(20, 12, 20, 10)
         
-        titolo = QLabel("Convertitore CBR / CBZ / PDF")
+        titolo = QLabel("Comic Convert")
         titolo.setFont(QFont("SF Pro Display", 18, QFont.Bold))
         titolo.setStyleSheet("color: #cba6f7;")
         h_layout.addWidget(titolo)
         
-        sottotitolo = QLabel("Converti fumetti tra formati CBR, CBZ e PDF")
+        sottotitolo = QLabel("Converti fumetti tra formati CBR, CBZ, PDF")
         sottotitolo.setFont(QFont("SF Pro Text", 10))
         sottotitolo.setStyleSheet("color: #6c7086;")
         h_layout.addWidget(sottotitolo)
