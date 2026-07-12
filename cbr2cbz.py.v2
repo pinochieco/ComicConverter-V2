@@ -16,36 +16,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap
 
-import logging
-import sys
-LOG_FILE = os.path.expanduser("~/comic_convert_debug.log")
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-logging.debug("=== ComicConvert avviato ===")
-
-def trova_unar():
-    """Trova il percorso di unar, prima nel bundle poi nel sistema"""
-    # Se siamo in un bundle PyInstaller
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        bundle_unar = os.path.join(sys._MEIPASS, 'unar')
-        if os.path.exists(bundle_unar):
-            logging.debug(f'unar trovato nel bundle: {bundle_unar}')
-            return bundle_unar
-    # Percorso assoluto di sistema
-    if os.path.exists('/usr/local/bin/unar'):
-        return '/usr/local/bin/unar'
-    # which
-    import shutil
-    which_unar = shutil.which('unar')
-    if which_unar:
-        return which_unar
-    return '/usr/local/bin/unar'  # fallback
-
-UNAR_PATH = trova_unar()
-logging.debug(f'UNAR_PATH = {UNAR_PATH}')
-
-
-
 
 class Segnali(QObject):
     """Segnali per comunicazione thread-safe con la GUI"""
@@ -65,30 +35,16 @@ class Convertitore:
         totale = len(files)
         ok = 0
         errs = 0
-        logging.debug(f"Avvio conversione: {totale} file, formato output={formato_output}, elimina={elimina}")
         
         for i, f in enumerate(files):
-            # Calcola il nome del file di output
-            if cartella_output:
-                if formato_output == "CBZ":
-                    nome_output = Path(cartella_output) / (f.stem + ".cbz")
-                else:
-                    nome_output = Path(cartella_output) / (f.stem + ".pdf")
-            else:
-                if formato_output == "CBZ":
-                    nome_output = f.with_suffix(".cbz")
-                else:
-                    nome_output = f.with_suffix(".pdf")
-            
-            self.segnali.aggiorna_file.emit(f.name, nome_output.name, "Elaborazione...")
+            self.segnali.aggiorna_file.emit(f.name, "Elaborazione...")
             self.segnali.aggiorna_stato.emit(f"Convertendo: {f.name}")
             
             try:
-                logging.debug(f"Elaborazione: {f.name} -> {nome_output.name}")
                 if f.suffix.lower() == ".cbr":
                     if formato_output == "CBZ":
                         risultato = self._cbr_in_cbz(f, cartella_output)
-                    else:
+                    else:  # PDF
                         risultato = self._cbr_in_pdf(f, cartella_output)
                 elif f.suffix.lower() == ".cbz":
                     if formato_output == "PDF":
@@ -107,34 +63,30 @@ class Convertitore:
                 
                 if risultato[0]:
                     ok += 1
+                    self.segnali.aggiorna_file.emit(f.name, "OK")
                     if elimina:
                         try:
                             os.remove(str(f))
+                            self.segnali.aggiorna_file.emit(f.name, "OK (eliminato)")
                         except:
                             pass
-                    self.segnali.aggiorna_file.emit(f.name, nome_output.name, "OK")
                 else:
                     errs += 1
-                    self.segnali.aggiorna_file.emit(f.name, nome_output.name, f"ERRORE: {risultato[1][:40]}")
+                    self.segnali.aggiorna_file.emit(f.name, f"ERRORE: {risultato[1][:40]}")
             except Exception as e:
                 errs += 1
-                logging.error(f"Errore convertendo {f.name}: {str(e)}", exc_info=True)
-                self.segnali.aggiorna_file.emit(f.name, nome_output.name, f"ERRORE")
+                self.segnali.aggiorna_file.emit(f.name, f"ERRORE")
             
             self.segnali.aggiorna_progresso.emit(i + 1, totale)
         
         self.segnali.fine_conversione.emit(ok, errs)
-
+    
     def _cbr_in_cbz(self, file_in, cartella_out=""):
-        logging.debug(f"_cbr_in_cbz: INIZIO {file_in.name}")
         tmp = tempfile.mkdtemp(prefix="cbr2cbz_")
         try:
-            r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
+            r = subprocess.run(["unar", "-o", tmp, "-q", str(file_in)],
                                capture_output=True, timeout=120)
-            logging.debug(f"_cbr_in_cbz: unar completato, returncode={r.returncode}")
             if r.returncode != 0:
-                stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbr_in_cbz: unar fallito: {stderr}")
                 return False, "unar fallito"
             
             immagini = []
@@ -142,10 +94,7 @@ class Convertitore:
                 for img in sorted(files):
                     immagini.append(os.path.join(root, img))
             
-            logging.debug(f"_cbr_in_cbz: trovate {len(immagini)} immagini")
-            
             if not immagini:
-                logging.error(f"_cbr_in_cbz: nessuna immagine da {file_in.name}")
                 return False, "Nessuna immagine estratta"
             
             if cartella_out:
@@ -157,27 +106,20 @@ class Convertitore:
                 for img in immagini:
                     zf.write(img, os.path.basename(img))
             
-            logging.debug(f"_cbr_in_cbz: CBZ creato: {dest.name}")
             return True, "OK"
         except subprocess.TimeoutExpired:
-            logging.error(f"_cbr_in_cbz: timeout per {file_in.name}")
             return False, "Timeout"
         except Exception as e:
-            logging.error(f"_cbr_in_cbz: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
             return False, str(e)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     
     def _cbr_in_pdf(self, file_in, cartella_out=""):
-        logging.debug(f"_cbr_in_pdf: INIZIO {file_in.name}")
         tmp = tempfile.mkdtemp(prefix="cbr2pdf_")
         try:
-            r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
+            r = subprocess.run(["unar", "-o", tmp, "-q", str(file_in)],
                                capture_output=True, timeout=120)
-            logging.debug(f"_cbr_in_pdf: unar completato, returncode={r.returncode}")
             if r.returncode != 0:
-                stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbr_in_pdf: unar fallito: {stderr}")
                 return False, "unar fallito"
             
             immagini = []
@@ -187,10 +129,7 @@ class Convertitore:
                     if os.path.isfile(img_path):
                         immagini.append(img_path)
             
-            logging.debug(f"_cbr_in_pdf: trovate {len(immagini)} immagini")
-            
             if not immagini:
-                logging.error(f"_cbr_in_pdf: nessuna immagine estratta da {file_in.name}")
                 return False, "Nessuna immagine estratta"
             
             if cartella_out:
@@ -205,40 +144,26 @@ class Convertitore:
                 try:
                     im = Image.open(img).convert("RGB")
                     immagini_pil.append(im)
-                except Exception as e_img:
-                    logging.debug(f"_cbr_in_pdf: skip immagine {img}: {e_img}")
+                except:
                     continue
-            
-            logging.debug(f"_cbr_in_pdf: {len(immagini_pil)} immagini valide per PDF")
             
             if immagini_pil:
                 immagini_pil[0].save(str(dest), save_all=True,
                                       append_images=immagini_pil[1:])
-                logging.debug(f"_cbr_in_pdf: PDF creato: {dest.name}")
                 return True, "OK"
             else:
-                logging.error(f"_cbr_in_pdf: nessuna immagine valida in {file_in.name}")
                 return False, "Nessuna immagine valida"
         except Exception as e:
-            logging.error(f"_cbr_in_pdf: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
             return False, str(e)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     
     def _cbz_in_pdf(self, file_in, cartella_out=""):
-        logging.debug(f"_cbz_in_pdf: INIZIO {file_in.name}")
         tmp = tempfile.mkdtemp(prefix="cbz2pdf_")
         try:
-            # Prova prima con unar, che supporta vari formati (RAR, ZIP, 7z, ecc.)
-            logging.debug(f"_cbz_in_pdf: estraggo con unar: {file_in.name}")
-            r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
-                               capture_output=True, timeout=120)
-            if r.returncode != 0:
-                stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbz_in_pdf: unar fallito: {stderr}")
-                return False, f"unar fallito: {stderr}"
+            with zipfile.ZipFile(str(file_in), "r") as zf:
+                zf.extractall(tmp)
             
-            logging.debug(f"_cbz_in_pdf: estrazione con unar completata")
             immagini = []
             for root, _, files in os.walk(tmp):
                 for img in sorted(files):
@@ -246,10 +171,7 @@ class Convertitore:
                     if os.path.isfile(img_path):
                         immagini.append(img_path)
             
-            logging.debug(f"_cbz_in_pdf: trovate {len(immagini)} immagini")
-            
             if not immagini:
-                logging.error(f"_cbz_in_pdf: nessuna immagine in {file_in.name}")
                 return False, "Nessuna immagine nell'archivio"
             
             if cartella_out:
@@ -263,25 +185,16 @@ class Convertitore:
                 try:
                     im = Image.open(img).convert("RGB")
                     immagini_pil.append(im)
-                except Exception as e_img:
-                    logging.debug(f"_cbz_in_pdf: skip immagine {img}: {e_img}")
+                except:
                     continue
-            
-            logging.debug(f"_cbz_in_pdf: {len(immagini_pil)} immagini valide per PDF")
             
             if immagini_pil:
                 immagini_pil[0].save(str(dest), save_all=True,
                                       append_images=immagini_pil[1:])
-                logging.debug(f"_cbz_in_pdf: PDF creato: {dest.name}")
                 return True, "OK"
             else:
-                logging.error(f"_cbz_in_pdf: nessuna immagine valida in {file_in.name}")
                 return False, "Nessuna immagine valida"
-        except subprocess.TimeoutExpired:
-            logging.error(f"_cbz_in_pdf: timeout per {file_in.name}")
-            return False, "Timeout"
         except Exception as e:
-            logging.error(f"_cbz_in_pdf: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
             return False, str(e)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -290,7 +203,6 @@ class Convertitore:
         """Converte un PDF in CBZ estraendo le pagine come immagini"""
         tmp = tempfile.mkdtemp(prefix="pdf2cbz_")
         try:
-            logging.debug(f"_pdf_in_cbz: conversione {file_in.name}")
             from PIL import Image
             import fitz  # PyMuPDF per estrarre pagine PDF
             pdf_doc = fitz.open(str(file_in))
@@ -888,20 +800,13 @@ class MainWindow(QMainWindow):
             if item and item.flags() & Qt.ItemIsUserCheckable:
                 item.setCheckState(Qt.Unchecked)
     
-    def _on_file_stato(self, nome, nome_output, stato):
+    def _on_file_stato(self, nome, stato):
         # Aggiorna il label del file in elaborazione
         if stato == "Elaborazione...":
             self.label_file_corrente.setText(f"▶ {nome}")
-        elif stato == "OK":
-            # Controlla se il nome_output è già presente (evita duplicati)
-            gia_presente = False
-            for i in range(self.lista_elaborati.count()):
-                if nome_output in self.lista_elaborati.item(i).text():
-                    gia_presente = True
-                    break
-            if not gia_presente:
-                self.lista_elaborati.addItem(f"✅ {nome_output}")
-                self.lista_elaborati.scrollToBottom()
+        elif stato == "OK" or stato.startswith("OK"):
+            self.lista_elaborati.addItem(f"✅ {nome}")
+            self.lista_elaborati.scrollToBottom()
             self.label_file_corrente.setText("")
         elif stato.startswith("ERRORE"):
             self.lista_elaborati.addItem(f"❌ {nome}")
@@ -915,13 +820,12 @@ class MainWindow(QMainWindow):
                 if stato == "Elaborazione...":
                     item.setBackground(QColor("#313244"))
                     self.lista_file.setCurrentRow(i)
-                elif stato == "OK":
-                    if "[OK]" not in item.text():
-                        testo_base = item.text().split("  (")[0]
-                        item.setText(f"{testo_base}  [OK]")
-                        item.setCheckState(Qt.Checked)
-                        item.setForeground(QColor("#a6e3a1"))
-                        item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
+                elif stato == "OK" or stato.startswith("OK"):
+                    testo_base = item.text().split("  (")[0]
+                    item.setText(f"{testo_base}  [OK]")
+                    item.setCheckState(Qt.Checked)
+                    item.setForeground(QColor("#a6e3a1"))
+                    item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 elif stato.startswith("ERRORE"):
                     testo_base = item.text().split("  (")[0]
                     item.setText(f"{testo_base}  [ERRORE]")
@@ -929,7 +833,7 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor("#f38ba8"))
                     item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 break
-
+    
     def _on_progresso(self, corrente, totale):
         self.progresso.setMaximum(totale)
         self.progresso.setValue(corrente)
