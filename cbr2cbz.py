@@ -790,20 +790,21 @@ class MainWindow(QMainWindow):
         if formato_input in ("PDF", "Tutti i formati"):
             estensioni_valide.append(".pdf")
         
+        # Funzione per escludere file nascosti (che iniziano con "." o "._")
+        def _is_hidden(path_obj):
+            name = path_obj.name
+            return name.startswith('.') or name.startswith('._')
+        
         files_trovati = []
         p = Path(path)
         if self.chk_ricorsivo.isChecked():
-            pattern = "**/*"
-            for f in p.glob(pattern):
-                if f.is_file() and f.suffix.lower() in [".cbr", ".cbz"]:
-                    if f.suffix.lower() == ".cbr" and "CBR" in self.cmb_input.currentText():
-                        files_trovati.append(f)
-                    elif f.suffix.lower() == ".cbz" and "CBZ" in self.cmb_input.currentText():
-                        files_trovati.append(f)
+            for f in p.glob("**/*"):
+                if f.is_file() and not _is_hidden(f) and f.suffix.lower() in estensioni_valide:
+                    files_trovati.append(f)
         else:
             for ext in estensioni_valide:
-                # glob vuole il punto, trasformiamo .cbr in *.cbr
-                files_trovati.extend(sorted(p.glob(f"*{ext}")))
+                files_trovati.extend(f for f in sorted(p.glob(f"*{ext}"))
+                                     if not _is_hidden(f))
         
         files_trovati = sorted(set(files_trovati))
         
