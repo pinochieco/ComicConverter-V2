@@ -28,11 +28,18 @@ logging.debug("=== ComicConvert avviato ===")
 def trova_unar():
     """Trova il percorso di unar, prima nel bundle poi nel sistema"""
     # Se siamo in un bundle PyInstaller
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-        bundle_unar = os.path.join(sys._MEIPASS, 'unar')
-        if os.path.exists(bundle_unar):
-            logging.debug(f'unar trovato nel bundle: {bundle_unar}')
-            return bundle_unar
+    if getattr(sys, 'frozen', False):
+        candidates = []
+        if hasattr(sys, '_MEIPASS'):
+            candidates.append(os.path.join(sys._MEIPASS, 'unar'))
+            candidates.append(os.path.join(sys._MEIPASS, '_internal', 'unar'))
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, 'unar'))
+        candidates.append(os.path.join(os.path.dirname(exe_dir), 'Frameworks', 'unar'))
+        for c in candidates:
+            if os.path.exists(c):
+                logging.debug(f'unar trovato nel bundle: {c}')
+                return c
     # Percorso assoluto di sistema
     if os.path.exists('/usr/local/bin/unar'):
         return '/usr/local/bin/unar'

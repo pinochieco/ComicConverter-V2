@@ -5,7 +5,7 @@
 cd "$(dirname "$0")"
 
 APP_NAME="ComicConverter"
-APP_VERSION="1.5"
+APP_VERSION="2.0"
 ICON_FILE="ComicConverter.icns"
 DMG_NAME="${APP_NAME}_${APP_VERSION}"
 
