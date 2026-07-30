@@ -4,7 +4,7 @@ CBR2CBZ v2.0 - Convertitore CBR/CBZ con interfaccia PyQt5
 Supporta: CBR->CBZ, CBR->PDF, CBZ->PDF
 """
 
-import os, sys, shutil, tempfile, zipfile, subprocess, threading
+import os, sys, shutil, tempfile, zipfile, subprocess, threading, gc
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -17,10 +17,12 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QPalette, QColor, QPixmap
 
 import logging
-import sys
+from logging.handlers import RotatingFileHandler
 LOG_FILE = os.path.expanduser("~/comic_convert_debug.log")
-logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=2)
+_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logging.basicConfig(level=logging.DEBUG, handlers=[_handler])
 logging.debug("=== ComicConvert avviato ===")
 
 def trova_unar():
@@ -68,7 +70,7 @@ class Convertitore:
         logging.debug(f"Avvio conversione: {totale} file, formato output={formato_output}, elimina={elimina}")
         
         for i, f in enumerate(files):
-            # Calcola il nome del file di output
+            # Calcola il nome del file di output (senza suffisso)
             if cartella_output:
                 if formato_output == "CBZ":
                     nome_output = Path(cartella_output) / (f.stem + ".cbz")
@@ -91,19 +93,21 @@ class Convertitore:
                     else:
                         risultato = self._cbr_in_pdf(f, cartella_output)
                 elif f.suffix.lower() == ".cbz":
-                    if formato_output == "PDF":
-                        risultato = self._cbz_in_pdf(f, cartella_output)
+                    if formato_output == "CBZ":
+                        risultato = self._cbr_in_cbz(f, cartella_output)
                     else:
                         risultato = self._cbz_in_pdf(f, cartella_output)
                 elif f.suffix.lower() == ".pdf":
                     if formato_output == "CBZ":
                         risultato = self._pdf_in_cbz(f, cartella_output)
                     elif formato_output == "CBR":
-                        risultato = (False, "CBR non supportato, usa CBZ")
+                        risultato = (False, "CBR non supportato, usa CBZ", "")
                     else:
-                        risultato = (False, "Formato non supportato")
+                        risultato = (False, "Formato non supportato", "")
                 else:
-                    risultato = (False, "Formato non supportato")
+                    risultato = (False, "Formato non supportato", "")
+                
+                nome_out_finale = Path(risultato[2]).name if len(risultato) > 2 and risultato[2] else nome_output.name
                 
                 if risultato[0]:
                     ok += 1
@@ -112,10 +116,10 @@ class Convertitore:
                             os.remove(str(f))
                         except:
                             pass
-                    self.segnali.aggiorna_file.emit(f.name, nome_output.name, "OK")
+                    self.segnali.aggiorna_file.emit(f.name, nome_out_finale, risultato[1])
                 else:
                     errs += 1
-                    self.segnali.aggiorna_file.emit(f.name, nome_output.name, f"ERRORE: {risultato[1][:40]}")
+                    self.segnali.aggiorna_file.emit(f.name, nome_out_finale, f"ERRORE: {risultato[1][:40]}")
             except Exception as e:
                 errs += 1
                 logging.error(f"Errore convertendo {f.name}: {str(e)}", exc_info=True)
@@ -124,6 +128,7 @@ class Convertitore:
             self.segnali.aggiorna_progresso.emit(i + 1, totale)
         
         self.segnali.fine_conversione.emit(ok, errs)
+        gc.collect()
 
     def _cbr_in_cbz(self, file_in, cartella_out=""):
         logging.debug(f"_cbr_in_cbz: INIZIO {file_in.name}")
@@ -132,10 +137,10 @@ class Convertitore:
             r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
                                capture_output=True, timeout=120)
             logging.debug(f"_cbr_in_cbz: unar completato, returncode={r.returncode}")
-            if r.returncode != 0:
+            pagine_perse = (r.returncode != 0)
+            if pagine_perse:
                 stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbr_in_cbz: unar fallito: {stderr}")
-                return False, "unar fallito"
+                logging.warning(f"_cbr_in_cbz: unar ha riportato errori (alcune pagine potrebbero mancare): {stderr}")
             
             immagini = []
             for root, _, files in os.walk(tmp):
@@ -146,25 +151,30 @@ class Convertitore:
             
             if not immagini:
                 logging.error(f"_cbr_in_cbz: nessuna immagine da {file_in.name}")
-                return False, "Nessuna immagine estratta"
+                return False, "Nessuna immagine estratta", ""
             
             if cartella_out:
                 dest = Path(cartella_out) / (file_in.stem + ".cbz")
             else:
                 dest = file_in.with_suffix(".cbz")
             
+            if pagine_perse:
+                dest = dest.with_stem(dest.stem + "_errore")
+                logging.debug(f"_cbr_in_cbz: alcune pagine scartate, output rinominato: {dest.name}")
+            
             with zipfile.ZipFile(str(dest), "w", zipfile.ZIP_DEFLATED) as zf:
                 for img in immagini:
                     zf.write(img, os.path.basename(img))
             
             logging.debug(f"_cbr_in_cbz: CBZ creato: {dest.name}")
-            return True, "OK"
+            msg = "OK (pagine scartate)" if pagine_perse else "OK"
+            return True, msg, str(dest)
         except subprocess.TimeoutExpired:
             logging.error(f"_cbr_in_cbz: timeout per {file_in.name}")
-            return False, "Timeout"
+            return False, "Timeout", ""
         except Exception as e:
             logging.error(f"_cbr_in_cbz: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
-            return False, str(e)
+            return False, str(e), ""
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     
@@ -175,10 +185,10 @@ class Convertitore:
             r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
                                capture_output=True, timeout=120)
             logging.debug(f"_cbr_in_pdf: unar completato, returncode={r.returncode}")
-            if r.returncode != 0:
+            pagine_perse = (r.returncode != 0)
+            if pagine_perse:
                 stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbr_in_pdf: unar fallito: {stderr}")
-                return False, "unar fallito"
+                logging.warning(f"_cbr_in_pdf: unar ha riportato errori (alcune pagine potrebbero mancare): {stderr}")
             
             immagini = []
             for root, _, files in os.walk(tmp):
@@ -191,37 +201,52 @@ class Convertitore:
             
             if not immagini:
                 logging.error(f"_cbr_in_pdf: nessuna immagine estratta da {file_in.name}")
-                return False, "Nessuna immagine estratta"
+                return False, "Nessuna immagine estratta", ""
             
             if cartella_out:
                 dest = Path(cartella_out) / (file_in.stem + ".pdf")
             else:
                 dest = file_in.with_suffix(".pdf")
             
-            # Crea PDF con Pillow
-            from PIL import Image
-            immagini_pil = []
+            import fitz
+            doc = fitz.open()
+            ok_count = 0
             for img in immagini:
                 try:
-                    im = Image.open(img).convert("RGB")
-                    immagini_pil.append(im)
+                    pix = fitz.Pixmap(img)
+                    page = doc.new_page(width=pix.width, height=pix.height)
+                    page.insert_image(page.rect, filename=img)
+                    pix = None
+                    ok_count += 1
                 except Exception as e_img:
+                    pagine_perse = True
                     logging.debug(f"_cbr_in_pdf: skip immagine {img}: {e_img}")
                     continue
             
-            logging.debug(f"_cbr_in_pdf: {len(immagini_pil)} immagini valide per PDF")
+            logging.debug(f"_cbr_in_pdf: {ok_count} immagini valide per PDF")
             
-            if immagini_pil:
-                immagini_pil[0].save(str(dest), save_all=True,
-                                      append_images=immagini_pil[1:])
-                logging.debug(f"_cbr_in_pdf: PDF creato: {dest.name}")
-                return True, "OK"
-            else:
+            if ok_count == 0:
+                doc.close()
                 logging.error(f"_cbr_in_pdf: nessuna immagine valida in {file_in.name}")
-                return False, "Nessuna immagine valida"
+                return False, "Nessuna immagine valida", ""
+            
+            if pagine_perse:
+                dest = dest.with_stem(dest.stem + "_errore")
+                logging.debug(f"_cbr_in_pdf: alcune pagine scartate, output rinominato: {dest.name}")
+            
+            doc.save(str(dest), garbage=4, deflate=True)
+            doc.close()
+            logging.debug(f"_cbr_in_pdf: PDF creato: {dest.name}")
+            
+            scartate = len(immagini) - ok_count
+            msg = f"OK ({scartate} pagine scartate)" if pagine_perse else "OK"
+            return True, msg, str(dest)
+        except subprocess.TimeoutExpired:
+            logging.error(f"_cbr_in_pdf: timeout per {file_in.name}")
+            return False, "Timeout", ""
         except Exception as e:
             logging.error(f"_cbr_in_pdf: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
-            return False, str(e)
+            return False, str(e), ""
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     
@@ -229,14 +254,13 @@ class Convertitore:
         logging.debug(f"_cbz_in_pdf: INIZIO {file_in.name}")
         tmp = tempfile.mkdtemp(prefix="cbz2pdf_")
         try:
-            # Prova prima con unar, che supporta vari formati (RAR, ZIP, 7z, ecc.)
             logging.debug(f"_cbz_in_pdf: estraggo con unar: {file_in.name}")
             r = subprocess.run([UNAR_PATH, "-o", tmp, "-q", str(file_in)],
                                capture_output=True, timeout=120)
-            if r.returncode != 0:
+            pagine_perse = (r.returncode != 0)
+            if pagine_perse:
                 stderr = r.stderr.decode()[:200] if r.stderr else ""
-                logging.error(f"_cbz_in_pdf: unar fallito: {stderr}")
-                return False, f"unar fallito: {stderr}"
+                logging.warning(f"_cbz_in_pdf: unar ha riportato errori (alcune pagine potrebbero mancare): {stderr}")
             
             logging.debug(f"_cbz_in_pdf: estrazione con unar completata")
             immagini = []
@@ -250,39 +274,52 @@ class Convertitore:
             
             if not immagini:
                 logging.error(f"_cbz_in_pdf: nessuna immagine in {file_in.name}")
-                return False, "Nessuna immagine nell'archivio"
+                return False, "Nessuna immagine nell'archivio", ""
             
             if cartella_out:
                 dest = Path(cartella_out) / (file_in.stem + ".pdf")
             else:
                 dest = file_in.with_suffix(".pdf")
             
-            from PIL import Image
-            immagini_pil = []
+            import fitz
+            doc = fitz.open()
+            ok_count = 0
             for img in immagini:
                 try:
-                    im = Image.open(img).convert("RGB")
-                    immagini_pil.append(im)
+                    pix = fitz.Pixmap(img)
+                    page = doc.new_page(width=pix.width, height=pix.height)
+                    page.insert_image(page.rect, filename=img)
+                    pix = None
+                    ok_count += 1
                 except Exception as e_img:
+                    pagine_perse = True
                     logging.debug(f"_cbz_in_pdf: skip immagine {img}: {e_img}")
                     continue
             
-            logging.debug(f"_cbz_in_pdf: {len(immagini_pil)} immagini valide per PDF")
+            logging.debug(f"_cbz_in_pdf: {ok_count} immagini valide per PDF")
             
-            if immagini_pil:
-                immagini_pil[0].save(str(dest), save_all=True,
-                                      append_images=immagini_pil[1:])
-                logging.debug(f"_cbz_in_pdf: PDF creato: {dest.name}")
-                return True, "OK"
-            else:
+            if ok_count == 0:
+                doc.close()
                 logging.error(f"_cbz_in_pdf: nessuna immagine valida in {file_in.name}")
-                return False, "Nessuna immagine valida"
+                return False, "Nessuna immagine valida", ""
+            
+            if pagine_perse:
+                dest = dest.with_stem(dest.stem + "_errore")
+                logging.debug(f"_cbz_in_pdf: alcune pagine scartate, output rinominato: {dest.name}")
+            
+            doc.save(str(dest), garbage=4, deflate=True)
+            doc.close()
+            logging.debug(f"_cbz_in_pdf: PDF creato: {dest.name}")
+            
+            scartate = len(immagini) - ok_count
+            msg = f"OK ({scartate} pagine scartate)" if pagine_perse else "OK"
+            return True, msg, str(dest)
         except subprocess.TimeoutExpired:
             logging.error(f"_cbz_in_pdf: timeout per {file_in.name}")
-            return False, "Timeout"
+            return False, "Timeout", ""
         except Exception as e:
             logging.error(f"_cbz_in_pdf: ECCEZIONE {file_in.name}: {str(e)}", exc_info=True)
-            return False, str(e)
+            return False, str(e), ""
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     
@@ -291,24 +328,23 @@ class Convertitore:
         tmp = tempfile.mkdtemp(prefix="pdf2cbz_")
         try:
             logging.debug(f"_pdf_in_cbz: conversione {file_in.name}")
-            from PIL import Image
-            import fitz  # PyMuPDF per estrarre pagine PDF
+            import fitz
             pdf_doc = fitz.open(str(file_in))
             
             immagini_out = []
+            mat = fitz.Matrix(2.0, 2.0)  # 200 DPI circa
             for num_pagina in range(pdf_doc.page_count):
                 pagina = pdf_doc[num_pagina]
-                # Render pagina a 200 DPI
-                mat = fitz.Matrix(2.0, 2.0)  # 200 DPI circa
                 pix = pagina.get_pixmap(matrix=mat)
                 img_path = os.path.join(tmp, f"page_{num_pagina+1:04d}.png")
                 pix.save(img_path)
+                pix = None  # libera memoria C del pixmap immediatamente
                 immagini_out.append(img_path)
             
             pdf_doc.close()
             
             if not immagini_out:
-                return False, "Nessuna pagina estratta dal PDF"
+                return False, "Nessuna pagina estratta dal PDF", ""
             
             if cartella_out:
                 dest = Path(cartella_out) / (file_in.stem + ".cbz")
@@ -319,11 +355,11 @@ class Convertitore:
                 for img in immagini_out:
                     zf.write(img, os.path.basename(img))
             
-            return True, "OK"
+            return True, "OK", str(dest)
         except ImportError:
-            return False, "PyMuPDF non installato (pip3 install PyMuPDF)"
+            return False, "PyMuPDF non installato (pip3 install PyMuPDF)", ""
         except Exception as e:
-            return False, str(e)
+            return False, str(e), ""
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -366,12 +402,12 @@ class MainWindow(QMainWindow):
         h_layout.setContentsMargins(20, 12, 20, 10)
         
         titolo = QLabel("Comic Convert")
-        titolo.setFont(QFont("SF Pro Display", 18, QFont.Bold))
+        titolo.setFont(QFont("Helvetica Neue", 18, QFont.Bold))
         titolo.setStyleSheet("color: #cba6f7;")
         h_layout.addWidget(titolo)
         
         sottotitolo = QLabel("Converti fumetti tra formati CBR, CBZ, PDF")
-        sottotitolo.setFont(QFont("SF Pro Text", 10))
+        sottotitolo.setFont(QFont("Helvetica Neue", 10))
         sottotitolo.setStyleSheet("color: #6c7086;")
         h_layout.addWidget(sottotitolo)
         
@@ -389,18 +425,18 @@ class MainWindow(QMainWindow):
         riga1.setSpacing(8)
         
         lbl_cartella = QLabel("Cartella sorgente:")
-        lbl_cartella.setFont(QFont("SF Pro Text", 11, QFont.Bold))
+        lbl_cartella.setFont(QFont("Helvetica Neue", 11, QFont.Bold))
         lbl_cartella.setStyleSheet("color: #cdd6f4;")
         riga1.addWidget(lbl_cartella)
         
         self.txt_cartella = QLabel("Nessuna cartella selezionata")
-        self.txt_cartella.setFont(QFont("SF Pro Text", 10))
+        self.txt_cartella.setFont(QFont("Helvetica Neue", 10))
         self.txt_cartella.setStyleSheet("color: #6c7086; background: #313244; padding: 6px 10px; border-radius: 6px;")
         self.txt_cartella.setWordWrap(True)
         riga1.addWidget(self.txt_cartella, 1)
         
         btn_sfoglia = QPushButton("Sfoglia")
-        btn_sfoglia.setFont(QFont("SF Pro Text", 11))
+        btn_sfoglia.setFont(QFont("Helvetica Neue", 11))
         btn_sfoglia.setObjectName("btnSecondario")
         btn_sfoglia.setFixedWidth(100)
         btn_sfoglia.clicked.connect(self._sfoglia)
@@ -414,49 +450,49 @@ class MainWindow(QMainWindow):
         
         # Formato input
         lbl_in = QLabel("Formato input:")
-        lbl_in.setFont(QFont("SF Pro Text", 10, QFont.Bold))
+        lbl_in.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
         lbl_in.setStyleSheet("color: #cdd6f4;")
         riga_opts.addWidget(lbl_in)
         
         self.cmb_input = QComboBox()
         self.cmb_input.addItems(["CBR", "CBZ", "PDF", "CBR e CBZ", "Tutti i formati"])
-        self.cmb_input.setFont(QFont("SF Pro Text", 10))
+        self.cmb_input.setFont(QFont("Helvetica Neue", 10))
         self.cmb_input.setObjectName("combo")
         riga_opts.addWidget(self.cmb_input)
         
         # Freccia
         freccia = QLabel("\u2192")
-        freccia.setFont(QFont("SF Pro Display", 16, QFont.Bold))
+        freccia.setFont(QFont("Helvetica Neue", 16, QFont.Bold))
         freccia.setStyleSheet("color: #cba6f7; padding: 0 5px;")
         riga_opts.addWidget(freccia)
         
         # Formato output
         lbl_out = QLabel("Formato output:")
-        lbl_out.setFont(QFont("SF Pro Text", 10, QFont.Bold))
+        lbl_out.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
         lbl_out.setStyleSheet("color: #cdd6f4;")
         riga_opts.addWidget(lbl_out)
         
         self.cmb_output = QComboBox()
         self.cmb_output.addItems(["CBZ", "PDF"])
-        self.cmb_output.setFont(QFont("SF Pro Text", 10))
+        self.cmb_output.setFont(QFont("Helvetica Neue", 10))
         self.cmb_output.setObjectName("combo")
         riga_opts.addWidget(self.cmb_output)
         
         riga_opts.addStretch()
         
         self.chk_ricorsivo = QCheckBox("Includi sottocartelle")
-        self.chk_ricorsivo.setFont(QFont("SF Pro Text", 10))
+        self.chk_ricorsivo.setFont(QFont("Helvetica Neue", 10))
         self.chk_ricorsivo.setStyleSheet("color: #cdd6f4;")
         self.chk_ricorsivo.setChecked(True)
         riga_opts.addWidget(self.chk_ricorsivo)
         
         self.chk_elimina = QCheckBox("Elimina originali")
-        self.chk_elimina.setFont(QFont("SF Pro Text", 10))
+        self.chk_elimina.setFont(QFont("Helvetica Neue", 10))
         self.chk_elimina.setStyleSheet("color: #cdd6f4;")
         riga_opts.addWidget(self.chk_elimina)
         
         btn_scan = QPushButton("Scansiona")
-        btn_scan.setFont(QFont("SF Pro Text", 11, QFont.Bold))
+        btn_scan.setFont(QFont("Helvetica Neue", 11, QFont.Bold))
         btn_scan.setObjectName("btnSecondario")
         btn_scan.setFixedWidth(110)
         btn_scan.clicked.connect(self._scansiona)
@@ -469,25 +505,25 @@ class MainWindow(QMainWindow):
         riga_out.setSpacing(8)
         
         lbl_out_dir = QLabel("Cartella output (opzionale):")
-        lbl_out_dir.setFont(QFont("SF Pro Text", 10, QFont.Bold))
+        lbl_out_dir.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
         lbl_out_dir.setStyleSheet("color: #cdd6f4;")
         riga_out.addWidget(lbl_out_dir)
         
         self.txt_cartella_out = QLabel("Stessa cartella dei file originali")
-        self.txt_cartella_out.setFont(QFont("SF Pro Text", 10))
+        self.txt_cartella_out.setFont(QFont("Helvetica Neue", 10))
         self.txt_cartella_out.setStyleSheet("color: #6c7086; background: #313244; padding: 6px 10px; border-radius: 6px;")
         self.txt_cartella_out.setWordWrap(True)
         riga_out.addWidget(self.txt_cartella_out, 1)
         
         btn_out = QPushButton("Scegli...")
-        btn_out.setFont(QFont("SF Pro Text", 10))
+        btn_out.setFont(QFont("Helvetica Neue", 10))
         btn_out.setObjectName("btnTerziario")
         btn_out.setFixedWidth(90)
         btn_out.clicked.connect(self._sfoglia_output)
         riga_out.addWidget(btn_out)
         
         btn_reset = QPushButton("Reset")
-        btn_reset.setFont(QFont("SF Pro Text", 10))
+        btn_reset.setFont(QFont("Helvetica Neue", 10))
         btn_reset.setObjectName("btnTerziario")
         btn_reset.setFixedWidth(70)
         btn_reset.clicked.connect(self._reset_output)
@@ -513,21 +549,21 @@ class MainWindow(QMainWindow):
         # Intestazione con pulsanti selezione
         header_lista = QHBoxLayout()
         lbl_lista = QLabel("File trovati:")
-        lbl_lista.setFont(QFont("SF Pro Text", 11, QFont.Bold))
+        lbl_lista.setFont(QFont("Helvetica Neue", 11, QFont.Bold))
         lbl_lista.setStyleSheet("color: #cdd6f4;")
         header_lista.addWidget(lbl_lista)
         
         header_lista.addStretch()
         
         btn_sel_tutti = QPushButton("Seleziona tutti")
-        btn_sel_tutti.setFont(QFont("SF Pro Text", 9))
+        btn_sel_tutti.setFont(QFont("Helvetica Neue", 9))
         btn_sel_tutti.setObjectName("btnTerziario")
         btn_sel_tutti.setFixedWidth(110)
         btn_sel_tutti.clicked.connect(self._seleziona_tutti)
         header_lista.addWidget(btn_sel_tutti)
         
         btn_desel_tutti = QPushButton("Deseleziona tutti")
-        btn_desel_tutti.setFont(QFont("SF Pro Text", 9))
+        btn_desel_tutti.setFont(QFont("Helvetica Neue", 9))
         btn_desel_tutti.setObjectName("btnTerziario")
         btn_desel_tutti.setFixedWidth(120)
         btn_desel_tutti.clicked.connect(self._deseleziona_tutti)
@@ -536,7 +572,7 @@ class MainWindow(QMainWindow):
         sx_layout.addLayout(header_lista)
         
         self.lista_file = QListWidget()
-        self.lista_file.setFont(QFont("SF Pro Text", 10))
+        self.lista_file.setFont(QFont("Helvetica Neue", 10))
         self.lista_file.setStyleSheet("""
             QListWidget {
                 background: #1e1e2e;
@@ -557,7 +593,7 @@ class MainWindow(QMainWindow):
         
         # Info files
         self.lbl_info = QLabel("Nessun file caricato")
-        self.lbl_info.setFont(QFont("SF Pro Text", 9))
+        self.lbl_info.setFont(QFont("Helvetica Neue", 9))
         self.lbl_info.setStyleSheet("color: #6c7086;")
         sx_layout.addWidget(self.lbl_info)
         
@@ -569,12 +605,12 @@ class MainWindow(QMainWindow):
         dx_layout.setContentsMargins(5, 0, 0, 0)
         
         lbl_anteprima = QLabel("File elaborati:")
-        lbl_anteprima.setFont(QFont("SF Pro Text", 11, QFont.Bold))
+        lbl_anteprima.setFont(QFont("Helvetica Neue", 11, QFont.Bold))
         lbl_anteprima.setStyleSheet("color: #cdd6f4;")
         dx_layout.addWidget(lbl_anteprima)
         
         self.lista_elaborati = QListWidget()
-        self.lista_elaborati.setFont(QFont("SF Pro Text", 10))
+        self.lista_elaborati.setFont(QFont("Helvetica Neue", 10))
         self.lista_elaborati.setStyleSheet("""
             QListWidget {
                 background: #1e1e2e;
@@ -610,7 +646,7 @@ class MainWindow(QMainWindow):
         
         # File in elaborazione
         self.label_file_corrente = QLabel("")
-        self.label_file_corrente.setFont(QFont("SF Pro Text", 10, QFont.Bold))
+        self.label_file_corrente.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
         self.label_file_corrente.setStyleSheet("color: #f5c2e7; padding: 4px 0;")
         f_layout.addWidget(self.label_file_corrente)
         
@@ -627,14 +663,14 @@ class MainWindow(QMainWindow):
         riga_stato = QHBoxLayout()
         
         self.label_stato = QLabel("Pronto")
-        self.label_stato.setFont(QFont("SF Pro Text", 9))
+        self.label_stato.setFont(QFont("Helvetica Neue", 9))
         self.label_stato.setStyleSheet("color: #6c7086;")
         riga_stato.addWidget(self.label_stato)
         
         riga_stato.addStretch()
         
         self.label_conteggio = QLabel("")
-        self.label_conteggio.setFont(QFont("SF Pro Text", 9))
+        self.label_conteggio.setFont(QFont("Helvetica Neue", 9))
         self.label_conteggio.setStyleSheet("color: #6c7086;")
         riga_stato.addWidget(self.label_conteggio)
         
@@ -642,7 +678,7 @@ class MainWindow(QMainWindow):
         
         # Pulsante converti
         self.btn_converti = QPushButton("Avvia Conversione")
-        self.btn_converti.setFont(QFont("SF Pro Display", 13, QFont.Bold))
+        self.btn_converti.setFont(QFont("Helvetica Neue", 13, QFont.Bold))
         self.btn_converti.setObjectName("btnPrincipale")
         self.btn_converti.setFixedHeight(42)
         self.btn_converti.setEnabled(False)
@@ -656,7 +692,7 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget {
                 background-color: #1e1e2e;
                 color: #cdd6f4;
-                font-family: "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+                font-family: "Helvetica Neue", sans-serif;
             }
             QFrame#header {
                 background-color: #11111b;
@@ -892,8 +928,8 @@ class MainWindow(QMainWindow):
     def _on_file_stato(self, nome, nome_output, stato):
         # Aggiorna il label del file in elaborazione
         if stato == "Elaborazione...":
-            self.label_file_corrente.setText(f"▶ {nome}")
-        elif stato == "OK":
+            self.label_file_corrente.setText(f"[>] {nome}")
+        elif stato.startswith("OK"):
             # Controlla se il nome_output è già presente (evita duplicati)
             gia_presente = False
             for i in range(self.lista_elaborati.count()):
@@ -901,11 +937,14 @@ class MainWindow(QMainWindow):
                     gia_presente = True
                     break
             if not gia_presente:
-                self.lista_elaborati.addItem(f"✅ {nome_output}")
+                if "scartate" in stato or "scartati" in stato:
+                    self.lista_elaborati.addItem(f"[!] {nome_output}")
+                else:
+                    self.lista_elaborati.addItem(f"[OK] {nome_output}")
                 self.lista_elaborati.scrollToBottom()
             self.label_file_corrente.setText("")
         elif stato.startswith("ERRORE"):
-            self.lista_elaborati.addItem(f"❌ {nome}")
+            self.lista_elaborati.addItem(f"[X] {nome}")
             self.lista_elaborati.scrollToBottom()
             self.label_file_corrente.setText("")
         
@@ -916,12 +955,16 @@ class MainWindow(QMainWindow):
                 if stato == "Elaborazione...":
                     item.setBackground(QColor("#313244"))
                     self.lista_file.setCurrentRow(i)
-                elif stato == "OK":
-                    if "[OK]" not in item.text():
+                elif stato.startswith("OK"):
+                    if "[OK]" not in item.text() and "[SCARTI]" not in item.text():
                         testo_base = item.text().split("  (")[0]
-                        item.setText(f"{testo_base}  [OK]")
+                        if "scartate" in stato or "scartati" in stato:
+                            item.setText(f"{testo_base}  [SCARTI]")
+                            item.setForeground(QColor("#f9e2af"))
+                        else:
+                            item.setText(f"{testo_base}  [OK]")
+                            item.setForeground(QColor("#a6e3a1"))
                         item.setCheckState(Qt.Checked)
-                        item.setForeground(QColor("#a6e3a1"))
                         item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable)
                 elif stato.startswith("ERRORE"):
                     testo_base = item.text().split("  (")[0]
@@ -956,9 +999,9 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
-    app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     
     finestra = MainWindow()
     finestra.show()
